@@ -17,6 +17,7 @@ Tech Stack:
 """
 
 import os
+import importlib
 import sys
 import time
 import json
@@ -31,6 +32,7 @@ import traceback
 import base64
 import ctypes
 import asyncio
+from difflib import SequenceMatcher
 from abc import ABC, abstractmethod
 import numpy as np
 import cv2
@@ -70,6 +72,8 @@ DEFAULT_CONFIG = {
     "pause_scroll_on_text": True,
     "fuzzy_threshold": 70,
     "ocr_confidence": 0.20,
+    "ocr_interval_sec": 0.12,
+    "ocr_variant_limit": 4,
     "ocr_engine_preference": "auto", # "auto", "rapidocr", "winocr", "paddleocr"
     "enable_image_preprocessing": True,
     "enable_ocr_repair": True,       # Auto-repairs comic font OCR errors ("reqeests" -> "requests", etc.)
@@ -81,12 +85,14 @@ DEFAULT_CONFIG = {
     "normalize_casing": True,        # Convert screaming ALL-CAPS into natural spoken sentence casing
     
     # TTS Backend Settings
-    "tts_backend": "omnivoice",      # "omnivoice", "edgetts", "pyttsx3"
+    "tts_backend": "omnivoice",      # "omnivoice", "cosyvoice", "edgetts", "pyttsx3"
     "omnivoice_url": "http://127.0.0.1:8001",
     "omnivoice_ref_clip": "audio.wav",
     "omnivoice_ref_text": "",
     "omnivoice_language": "English",
     "omnivoice_duration_scale": 1.0, # 1.0x tight duration prevents looping, rereading, or trailing stutter
+    "cosyvoice_url": "http://127.0.0.1:50000",
+    "cosyvoice_mode": "zero_shot",
     "enable_omnivoice_prefetch": True,
     "max_tts_queue": 2,
     "allow_pyttsx3_fallback": False, # Prevent silent robotic fallback
@@ -150,7 +156,7 @@ COMMON_ENGLISH_WORDS = {
     "before", "better", "called", "change", "father", "friend", "little", "mother", "people", "should", "system",
     "hunter", "dungeon", "monster", "monsters", "dragon", "status", "window", "damage", "attack", "shield", "potion",
     "because", "another", "between", "country", "different", "picture", "thought", "through", "together", "without",
-    "mentioned", "unknown", "difficulty", "unidentifiable", "sophien", "emperor", "empress", "princess", "prince",
+    "mentioned", "unknown", "difficulty", "unidentifiable", "emperor", "empress", "princess", "prince",
     "energy", "wealthy", "magnate", "villain", "villains", "fate", "sharp", "eyesight", "telling", "notebook", "special",
     "minister", "ministers", "opposition", "immense", "issues", "demons", "surely", "praise", "petty", "compiled",
     "reinforce", "reliable", "workers", "lacking", "areas", "noticed", "feeling", "sense", "senses", "snow", "ugh",
@@ -163,6 +169,85 @@ LONG_VALID_WORDS = {
     "unknown", "dungeon", "monster", "monsters", "system", "hunter", "awakened", "ability", "destroy", "immediately",
     "opposition", "immense", "notebook", "eyesight", "magnate", "villains", "villain", "wealthy", "reinforce"
 }
+
+# Targets for conservative OCR correction. Unknown words are never changed to
+# arbitrary names; they must closely match one of these known words.
+MANHWA_CORRECTION_WORDS = COMMON_ENGLISH_WORDS | LONG_VALID_WORDS | {
+    "ability", "awakened", "awakening", "barrier", "captain", "character",
+    "clan", "combat", "cultivator", "curse", "defeat", "defense", "defend", "home",
+    "destroy", "destruction", "divine", "familiar", "fortress", "healing",
+    "heaven", "infinite", "invincible", "kingdom", "master", "medieval",
+    "mercenary", "mission", "noble", "palace", "portal", "possessed",
+    "regression", "return", "revenge", "ruler", "sacred", "secret",
+    "soldier", "strongest", "summon", "summoned", "tower", "training",
+    "treasure", "ultimate", "universe", "warrior", "weapon", "wizard",
+    "adventure", "ancient", "appearance", "command", "danger", "despair",
+    "discovery", "escape", "eternal", "fighting", "future", "healing",
+    "hidden", "identity", "legend", "legendary", "memory", "opponent",
+    "promise", "recognize", "resurrection", "ruins", "servant", "shadow",
+    "strength", "survive", "threat", "victory", "weakness", "chapter",
+    "academy", "archer", "assassin", "blacksmith", "demon", "dimension",
+    "equipment", "experience", "goddess", "heir", "immortal", "ingredient",
+    "merchant", "mission", "overlord", "phenomenon", "ranker", "relic",
+    "saint", "summoner", "suppress", "transcend", "transformation",
+}
+
+MANHWA_CORRECTION_INDEX = tuple(sorted(MANHWA_CORRECTION_WORDS))
+MANHWA_SAFE_CORRECTION_WORDS = COMMON_ENGLISH_WORDS | {"home"}
+
+def correct_manhwa_ocr_word(word: str) -> str:
+    """Correct only a high-confidence near-match to a known English term."""
+    if not word or len(word) < 4:
+        return word
+
+    core_match = re.fullmatch(r"([A-Za-z]+)([^A-Za-z]*)", word)
+    if not core_match:
+        return word
+    core, suffix = core_match.groups()
+    lower_core = core.lower()
+    if lower_core in MANHWA_CORRECTION_WORDS:
+        return word
+
+    candidates = []
+    for target in MANHWA_CORRECTION_INDEX:
+        if target not in MANHWA_SAFE_CORRECTION_WORDS:
+            continue
+        if abs(len(target) - len(lower_core)) > 1:
+            continue
+        if target[0] != lower_core[0]:
+            continue
+        ratio = SequenceMatcher(None, lower_core, target).ratio()
+        if ratio >= 0.86:
+            candidates.append((ratio, target))
+
+    if not candidates:
+        return word
+    candidates.sort(reverse=True)
+    best_ratio, best_target = candidates[0]
+    second_ratio = candidates[1][0] if len(candidates) > 1 else 0.0
+    # A single inserted/deleted character is acceptable, but only with a clear
+    # winner. This prevents ordinary names and invented terms being rewritten.
+    if best_ratio < 0.88 or (best_ratio < 0.94 and best_ratio - second_ratio < 0.04):
+        return word
+    if not any(
+        lower_core[:index] + lower_core[index + 1:] == best_target
+        for index in range(len(lower_core))
+    ):
+        return word
+
+    if core.isupper():
+        corrected = best_target.upper()
+    elif core[:1].isupper():
+        corrected = best_target.capitalize()
+    else:
+        corrected = best_target
+    return corrected + suffix
+
+def correct_manhwa_ocr_text(text: str) -> str:
+    return " ".join(correct_manhwa_ocr_word(token) for token in text.split())
+
+def ocr_agreement_key(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 def segment_concatenated_word(word: str) -> str:
     """
@@ -931,6 +1016,126 @@ class OmniVoiceTTS(BaseTTS):
             return False
 
 
+class CosyVoiceTTS(BaseTTS):
+    """Local CosyVoice Gradio client using zero-shot reference-voice cloning."""
+    def __init__(self, server_url, ref_clip, ref_text="", mode="zero_shot", log_fn=None):
+        self.server_url = server_url.rstrip("/")
+        self.ref_clip = ref_clip
+        self.ref_text = ref_text
+        self.mode = mode
+        self.gradio_client = None
+        self._cache_lock = threading.Lock()
+        self._prefetch_cache = {}
+        self._prefetch_inflight = set()
+        self._max_prefetch_cache = 6
+        threading.Thread(target=self._async_init_gradio, args=(log_fn,), daemon=True).start()
+
+    def _async_init_gradio(self, log_fn=None):
+        try:
+            from gradio_client import Client
+            self.gradio_client = Client(self.server_url)
+            if log_fn:
+                log_fn(f"📡 Connected to local CosyVoice at {self.server_url}")
+        except Exception as e:
+            if log_fn:
+                log_fn(f"⚠️ Local CosyVoice unavailable at {self.server_url}: {e}")
+
+    def _ensure_client(self, log_fn=None):
+        if self.gradio_client is not None:
+            return self.gradio_client
+        try:
+            from gradio_client import Client
+            self.gradio_client = Client(self.server_url)
+            return self.gradio_client
+        except Exception as e:
+            if log_fn:
+                log_fn(f"❌ CosyVoice connection failed: {e}")
+            return None
+
+    def _cache_key(self, text, speed):
+        return f"{text.lower()}|{round(float(speed), 3)}|{self.mode}"
+
+    def _predict_to_wav(self, clean_text, speed=1.0, log_fn=None):
+        client = self._ensure_client(log_fn)
+        if client is None:
+            return None
+
+        ref_path = os.path.abspath(os.path.normpath(self.ref_clip)) if self.ref_clip else ""
+        if not ref_path or not os.path.exists(ref_path):
+            if log_fn:
+                log_fn(f"❌ CosyVoice reference audio not found: {self.ref_clip}")
+            return None
+        if not self.ref_text.strip():
+            if log_fn:
+                log_fn("❌ CosyVoice requires the exact transcript of the reference audio.")
+            return None
+
+        from gradio_client import handle_file
+        result = client.predict(
+            tts_text=clean_text[:200],
+            mode_value=self.mode,
+            prompt_text=self.ref_text,
+            prompt_wav_upload=handle_file(ref_path),
+            prompt_wav_record=None,
+            instruct_text="",
+            seed=12345,
+            stream=False,
+            ui_lang="En",
+            api_name="/generate_audio"
+        )
+        return extract_audio_to_wav_file(result, log_fn)
+
+    def prefetch(self, text, speed=1.0, log_fn=None):
+        clean_text = normalize_dialogue_text(text, apply_casing=True, apply_repair=True)
+        if not clean_text:
+            return
+        key = self._cache_key(clean_text, speed)
+        with self._cache_lock:
+            if key in self._prefetch_cache or key in self._prefetch_inflight:
+                return
+            self._prefetch_inflight.add(key)
+
+        def worker():
+            try:
+                wav_file = self._predict_to_wav(clean_text, speed, log_fn=None)
+                if wav_file and os.path.exists(wav_file):
+                    with self._cache_lock:
+                        self._prefetch_cache[key] = wav_file
+                        while len(self._prefetch_cache) > self._max_prefetch_cache:
+                            old_key, old_path = self._prefetch_cache.popitem()
+                            if old_path != wav_file and os.path.exists(old_path):
+                                try:
+                                    os.remove(old_path)
+                                except OSError:
+                                    pass
+            except Exception:
+                pass
+            finally:
+                with self._cache_lock:
+                    self._prefetch_inflight.discard(key)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def synthesize_and_play_blocking(self, text, speed=1.0, log_fn=None):
+        clean_text = normalize_dialogue_text(text, apply_casing=True, apply_repair=True)
+        if not clean_text:
+            return True
+        key = self._cache_key(clean_text, speed)
+        with self._cache_lock:
+            wav_file = self._prefetch_cache.pop(key, None)
+        if wav_file and os.path.exists(wav_file):
+            if log_fn:
+                log_fn("⚡ Using prefetched CosyVoice audio.")
+        else:
+            try:
+                wav_file = self._predict_to_wav(clean_text, speed, log_fn)
+            except Exception as e:
+                if log_fn:
+                    log_fn(f"❌ CosyVoice Error: {e}")
+                return False
+        return bool(wav_file and play_wav_blocking(wav_file, log_fn))
+
+
 class EdgeTTSBackend(BaseTTS):
     """Ultra-realistic Microsoft Neural HD Studio voices (Christopher, Guy, Eric, Jenny, etc.). Zero hallucination."""
     def __init__(self, voice_name="en-US-ChristopherNeural"):
@@ -982,7 +1187,7 @@ class LocalPyttsx3TTS(BaseTTS):
         try:
             if sys.platform.startswith("win"):
                 try:
-                    import pythoncom
+                    pythoncom = importlib.import_module("pythoncom")
                     pythoncom.CoInitialize()
                 except Exception:
                     pass
@@ -1144,7 +1349,7 @@ class DialogueStabilizer:
 # ==========================================
 # ADVANCED MANHWA OCR PREPROCESSING
 # ==========================================
-def preprocess_manhwa_image(img_bgr, enable_advanced=True):
+def preprocess_manhwa_image(img_bgr, enable_advanced=True, max_variants=None):
     """
     Advanced multi-variant preprocessing tuned for manhwa speech bubbles & glowing font outlines:
     1. Raw BGR
@@ -1213,6 +1418,8 @@ def preprocess_manhwa_image(img_bgr, enable_advanced=True):
     except Exception as e:
         print(f"[Preprocess Warning]: {e}")
 
+    if max_variants is not None:
+        return variants[:max(1, int(max_variants))]
     return variants
 
 # ==========================================
@@ -1242,7 +1449,7 @@ class ResilientOCR:
         # 2. Windows Native Media OCR (Windows 10 & 11 Built-in)
         if self.preference in ("auto", "winocr"):
             try:
-                import winocr
+                winocr = importlib.import_module("winocr")
                 self.engine_instance = "winocr"
                 self.engine_type = "Windows 10/11 Native Media OCR (WinRT)"
                 print(f"[OCR] Loaded: {self.engine_type}")
@@ -1254,7 +1461,7 @@ class ResilientOCR:
         # 3. PaddleOCR Fallback
         if self.preference in ("auto", "paddleocr"):
             try:
-                from paddleocr import PaddleOCR
+                PaddleOCR = importlib.import_module("paddleocr").PaddleOCR
                 self.engine_instance = PaddleOCR(lang="en", use_angle_cls=True)
                 self.engine_type = "PaddleOCR (Standard Engine)"
                 print(f"[OCR] Loaded: {self.engine_type}")
@@ -1294,7 +1501,7 @@ class ResilientOCR:
                     return " ".join(lines).strip()
 
             elif self.engine_instance == "winocr":
-                import winocr
+                winocr = importlib.import_module("winocr")
                 pil_img = Image.fromarray(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB))
                 res = winocr.recognize_pil_sync(pil_img, lang="en")
                 if res and "text" in res:
@@ -1369,6 +1576,14 @@ class ScreenReaderEngine:
                 language=self.config.get("omnivoice_language", "English"),
                 duration_scale=float(self.config.get("omnivoice_duration_scale", 1.45)),
                 allow_fallback=self.config.get("allow_pyttsx3_fallback", False),
+                log_fn=self.log_fn
+            )
+        elif backend == "cosyvoice":
+            self.tts = CosyVoiceTTS(
+                server_url=self.config.get("cosyvoice_url", "http://127.0.0.1:50000"),
+                ref_clip=self.config.get("omnivoice_ref_clip", "audio.wav"),
+                ref_text=self.config.get("omnivoice_ref_text", ""),
+                mode=self.config.get("cosyvoice_mode", "zero_shot"),
                 log_fn=self.log_fn
             )
         elif backend == "edgetts":
@@ -1464,36 +1679,58 @@ class ScreenReaderEngine:
             return ""
         
         min_conf = float(self.config.get("ocr_confidence", 0.18))
-        apply_repair = bool(self.config.get("enable_ocr_repair", True))
+        is_manhwa = self.config.get("mode", "manhwa") == "manhwa"
+        apply_repair = is_manhwa and bool(self.config.get("enable_ocr_repair", True))
         variants = preprocess_manhwa_image(
             img_bgr,
-            enable_advanced=self.config.get("enable_image_preprocessing", True)
+            enable_advanced=self.config.get("enable_image_preprocessing", True),
+            max_variants=max(1, int(self.config.get("ocr_variant_limit", 4)))
         )
 
-        best_text = ""
-        best_score = -1.0
+        candidates = []
 
         for var in variants:
             text = self.ocr.extract_text(var, min_conf=min_conf)
             if text and len(text.strip()) >= 2:
                 repaired = repair_manhwa_ocr_text(text) if apply_repair else text
+                if is_manhwa:
+                    repaired = correct_manhwa_ocr_text(repaired)
                 words = [w.lower().strip(" '\",.!?") for w in repaired.split()]
                 valid_words_count = sum(1 for w in words if w in COMMON_ENGLISH_WORDS or len(w) >= 3 and w.isalpha())
                 # Score: heavily reward recognized coherent words and sentence structure
                 score = valid_words_count * 25.0 + len(words) * 8.0
                 clean_chars = sum(1 for c in repaired if c.isalnum() or c in " '\",.!?")
                 score += (clean_chars / max(1, len(repaired))) * 40.0
-                if score > best_score:
-                    best_score = score
-                    best_text = repaired
+                candidates.append({
+                    "text": repaired.strip(),
+                    "score": score,
+                    "agreement": ocr_agreement_key(repaired),
+                })
 
-        return best_text.strip()
+        if not candidates:
+            return ""
+
+        agreement_counts = {}
+        for candidate in candidates:
+            agreement_counts[candidate["agreement"]] = agreement_counts.get(candidate["agreement"], 0) + 1
+
+        best = max(
+            candidates,
+            key=lambda candidate: (
+                candidate["score"] + max(0, agreement_counts[candidate["agreement"]] - 1) * 45.0,
+                agreement_counts[candidate["agreement"]],
+                candidate["score"],
+            ),
+        )
+
+        return best["text"]
 
     def run_loop(self):
         self.running = True
         print("[Engine] Auto-Reader Thread Started.")
         last_paced_scroll_time = time.time()
         scroll_subdelta_accum = 0.0
+        next_ocr_time = 0.0
 
         with mss.mss() as sct:
             while self.running:
@@ -1502,8 +1739,12 @@ class ScreenReaderEngine:
                     continue
 
                 # 1. Screen Capture & OCR Detection
-                frame = self.capture_frame(sct)
-                raw_detected = self.extract_text(frame)
+                now = time.time()
+                raw_detected = ""
+                if now >= next_ocr_time:
+                    frame = self.capture_frame(sct)
+                    raw_detected = self.extract_text(frame)
+                    next_ocr_time = now + max(0.05, float(self.config.get("ocr_interval_sec", 0.12)))
 
                 # 2. Dialogue Settle & Sentence Completion Filter
                 finalized_dialogue = self.stabilizer.update(raw_detected)
@@ -1514,7 +1755,7 @@ class ScreenReaderEngine:
 
                 if (
                     self.config.get("enable_omnivoice_prefetch", True)
-                    and isinstance(self.tts, OmniVoiceTTS)
+                    and isinstance(self.tts, (OmniVoiceTTS, CosyVoiceTTS))
                     and self.stabilizer.candidate_text
                     and self.stabilizer.stable_frames >= 2
                     and not finalized_dialogue
@@ -1837,11 +2078,13 @@ class ManhwaReaderApp(ctk.CTk):
 
         ctk.CTkLabel(scroll, text="Voice Engine Backend", font=("Helvetica", 13, "bold")).pack(anchor="w", pady=(8, 4))
         self.seg_tts = ctk.CTkSegmentedButton(
-            scroll, values=["OmniVoice (Voice Clone)", "Edge-TTS (Studio HD)", "Local PyTTSx3"],
+            scroll, values=["CosyVoice (Local Clone)", "OmniVoice (Voice Clone)", "Edge-TTS (Studio HD)", "Local PyTTSx3"],
             command=self.save_and_apply
         )
         current_tts = self.config.get("tts_backend")
-        if current_tts == "omnivoice":
+        if current_tts == "cosyvoice":
+            self.seg_tts.set("CosyVoice (Local Clone)")
+        elif current_tts == "omnivoice":
             self.seg_tts.set("OmniVoice (Voice Clone)")
         elif current_tts == "edgetts":
             self.seg_tts.set("Edge-TTS (Studio HD)")
@@ -1854,6 +2097,15 @@ class ManhwaReaderApp(ctk.CTk):
         self.ent_url = ctk.CTkEntry(scroll, placeholder_text="http://127.0.0.1:8001")
         self.ent_url.insert(0, self.config.get("omnivoice_url", "http://127.0.0.1:8001"))
         self.ent_url.pack(fill="x", pady=4)
+
+        ctk.CTkLabel(scroll, text="Local CosyVoice Gradio Endpoint", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(12, 2))
+        self.ent_cosy_url = ctk.CTkEntry(scroll, placeholder_text="http://127.0.0.1:50000")
+        self.ent_cosy_url.insert(0, self.config.get("cosyvoice_url", "http://127.0.0.1:50000"))
+        self.ent_cosy_url.pack(fill="x", pady=4)
+
+        self.ent_cosy_mode = ctk.CTkOptionMenu(scroll, values=["zero_shot", "instruct"])
+        self.ent_cosy_mode.set(self.config.get("cosyvoice_mode", "zero_shot"))
+        self.ent_cosy_mode.pack(fill="x", pady=4)
 
         ctk.CTkLabel(scroll, text="Reference Audio Clip (Target Voice to Clone)", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(12, 2))
         ref_row = ctk.CTkFrame(scroll, fg_color="transparent")
@@ -2016,7 +2268,9 @@ class ManhwaReaderApp(ctk.CTk):
 
     def save_and_apply(self, _=None):
         tts_selection = self.seg_tts.get()
-        if "OmniVoice" in tts_selection:
+        if "CosyVoice" in tts_selection:
+            backend = "cosyvoice"
+        elif "OmniVoice" in tts_selection:
             backend = "omnivoice"
         elif "Edge-TTS" in tts_selection:
             backend = "edgetts"
@@ -2031,6 +2285,8 @@ class ManhwaReaderApp(ctk.CTk):
 
         self.config["tts_backend"] = backend
         self.config["omnivoice_url"] = self.ent_url.get().strip()
+        self.config["cosyvoice_url"] = self.ent_cosy_url.get().strip()
+        self.config["cosyvoice_mode"] = self.ent_cosy_mode.get()
         self.config["omnivoice_ref_clip"] = self.ent_ref.get().strip()
         self.config["omnivoice_ref_text"] = self.ent_transcript.get().strip()
         self.config["edge_tts_voice"] = self.ent_edge_voice.get()
