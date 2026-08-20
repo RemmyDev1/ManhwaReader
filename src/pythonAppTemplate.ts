@@ -1004,6 +1004,7 @@ class CosyVoiceTTS(BaseTTS):
         self.ref_text = ref_text
         self.mode = mode
         self.gradio_client = None
+        self.api_schema = None
         self._cache_lock = threading.Lock()
         self._prefetch_cache = {}
         self._prefetch_inflight = set()
@@ -1014,6 +1015,10 @@ class CosyVoiceTTS(BaseTTS):
         try:
             from gradio_client import Client
             self.gradio_client = Client(self.server_url)
+            try:
+                self.api_schema = self.gradio_client.view_api(return_format="dict")
+            except Exception:
+                self.api_schema = None
             if log_fn:
                 log_fn(f\"📡 Connected to local CosyVoice at {self.server_url}\")
         except Exception as e:
@@ -1026,11 +1031,161 @@ class CosyVoiceTTS(BaseTTS):
         try:
             from gradio_client import Client
             self.gradio_client = Client(self.server_url)
+            try:
+                self.api_schema = self.gradio_client.view_api(return_format="dict")
+            except Exception:
+                self.api_schema = None
             return self.gradio_client
         except Exception as e:
             if log_fn:
                 log_fn(f\"❌ CosyVoice connection failed: {e}\")
             return None
+
+    def _get_named_endpoints(self):
+        if not isinstance(self.api_schema, dict):
+            return {}
+        named = self.api_schema.get("named_endpoints", {})
+        return named if isinstance(named, dict) else {}
+
+    def _resolve_generate_api_name(self):
+        named = self._get_named_endpoints()
+        if "/generate_audio" in named:
+            return "/generate_audio"
+        for candidate in ["/generate", "/inference", "/tts", "/predict"]:
+            if candidate in named:
+                return candidate
+        if named:
+            return next(iter(named.keys()))
+        return "/generate_audio"
+
+    def _endpoint_param_names(self, api_name):
+        params = self._endpoint_params(api_name)
+        names = []
+        for item in params:
+            if isinstance(item, dict):
+                p = item.get("parameter_name")
+                if isinstance(p, str):
+                    names.append(p)
+        return names
+
+    def _endpoint_params(self, api_name):
+        named = self._get_named_endpoints()
+        endpoint = named.get(api_name, {})
+        params = endpoint.get("parameters", [])
+        return params if isinstance(params, list) else []
+
+    def _literal_choices_from_type(self, python_type):
+        if isinstance(python_type, dict):
+            type_str = python_type.get("type", "")
+        else:
+            type_str = str(python_type) if python_type is not None else ""
+        if "Literal[" not in type_str:
+            return []
+        values = re.findall(r"'([^']*)'", type_str)
+        return values if values else []
+
+    def _param_meta(self, api_name):
+        meta = {}
+        for item in self._endpoint_params(api_name):
+            if isinstance(item, dict):
+                name = item.get("parameter_name")
+                if isinstance(name, str):
+                    meta[name] = item
+        return meta
+
+    def _resolve_mode_label(self, mode_choices):
+        mode_key = str(self.mode or "").strip().lower()
+        mode_map = {
+            "zero_shot": "3s极速复刻",
+            "instruct": "自然语言控制",
+            "cross_lingual": "跨语种复刻",
+            "sft": "预训练音色",
+            "pretrained": "预训练音色",
+        }
+        preferred = mode_map.get(mode_key, self.mode)
+        if mode_choices:
+            if preferred in mode_choices:
+                return preferred
+            if isinstance(self.mode, str) and self.mode in mode_choices:
+                return self.mode
+            return mode_choices[0]
+        return preferred
+
+    def _mode_candidates(self, mode_choices):
+        primary = self._resolve_mode_label(mode_choices)
+        candidates = [primary]
+        for item in mode_choices:
+            if item not in candidates:
+                candidates.append(item)
+        return candidates
+
+    def _first_present_key(self, candidates, available_names):
+        for name in candidates:
+            if name in available_names:
+                return name
+        return None
+
+    def _build_dynamic_payload(self, clean_text, ref_file, api_name, speed=1.0):
+        names = self._endpoint_param_names(api_name)
+        names_set = set(names)
+        meta = self._param_meta(api_name)
+        payload = {}
+
+        text_key = self._first_present_key(["tts_text", "text", "input_text", "synthesis_text"], names_set)
+        if text_key:
+            payload[text_key] = clean_text[:200]
+
+        mode_key = self._first_present_key(["mode_value", "mode", "tts_mode", "mode_checkbox_group"], names_set)
+        if mode_key:
+            mode_choices = self._literal_choices_from_type(meta.get(mode_key, {}).get("python_type"))
+            payload[mode_key] = self._resolve_mode_label(mode_choices)
+
+        prompt_text_key = self._first_present_key(["prompt_text", "ref_text", "reference_text"], names_set)
+        if prompt_text_key and self.ref_text:
+            payload[prompt_text_key] = self.ref_text
+
+        prompt_wav_key = self._first_present_key(["prompt_wav_upload", "prompt_wav", "ref_wav", "reference_audio"], names_set)
+        if prompt_wav_key:
+            payload[prompt_wav_key] = ref_file
+
+        record_key = self._first_present_key(["prompt_wav_record", "record_audio"], names_set)
+        if record_key:
+            payload[record_key] = ref_file
+
+        instruct_key = self._first_present_key(["instruct_text", "instruction"], names_set)
+        if instruct_key:
+            payload[instruct_key] = ""
+
+        seed_key = self._first_present_key(["seed", "random_seed"], names_set)
+        if seed_key:
+            payload[seed_key] = 12345
+
+        stream_key = self._first_present_key(["stream", "is_stream", "streaming"], names_set)
+        if stream_key:
+            payload[stream_key] = False
+
+        lang_key = self._first_present_key(["ui_lang", "language", "lang"], names_set)
+        if lang_key:
+            payload[lang_key] = "En"
+
+        sft_key = self._first_present_key(["sft_dropdown", "voice_dropdown"], names_set)
+        if sft_key:
+            sft_choices = self._literal_choices_from_type(meta.get(sft_key, {}).get("python_type"))
+            payload[sft_key] = sft_choices[0] if sft_choices else ""
+
+        speed_key = self._first_present_key(["speed", "speech_speed"], names_set)
+        if speed_key:
+            payload[speed_key] = float(speed)
+
+        if not names:
+            payload = {
+                "tts_text": clean_text[:200],
+                "prompt_text": self.ref_text,
+                "prompt_wav_upload": ref_file,
+                "mode": self.mode,
+            }
+
+        return payload, names, meta
 
     def _cache_key(self, text, speed):
         return f\"{text.lower()}|{round(float(speed), 3)}|{self.mode}\"
@@ -1049,13 +1204,76 @@ class CosyVoiceTTS(BaseTTS):
                 log_fn(\"❌ CosyVoice requires the exact transcript of the reference audio.\")
             return None
         from gradio_client import handle_file
-        result = client.predict(
-            tts_text=clean_text[:200], mode_value=self.mode,
-            prompt_text=self.ref_text, prompt_wav_upload=handle_file(ref_path),
-            prompt_wav_record=None, instruct_text=\"\", seed=12345,
-            stream=False, ui_lang=\"En\", api_name=\"/generate_audio\"
-        )
-        return extract_audio_to_wav_file(result, log_fn)
+        api_name = self._resolve_generate_api_name()
+        ref_file = handle_file(ref_path)
+        payload, param_names, meta = self._build_dynamic_payload(clean_text, ref_file, api_name, speed=speed)
+        if log_fn and param_names:
+            log_fn(f\"🧩 CosyVoice endpoint {api_name} params: {', '.join(param_names)}\")
+        if "/change_instruction" in self._get_named_endpoints():
+            mode_key = self._first_present_key(["mode_value", "mode", "tts_mode", "mode_checkbox_group"], set(param_names))
+            if mode_key and mode_key in payload:
+                try:
+                    client.predict(payload[mode_key], api_name="/change_instruction")
+                except Exception:
+                    pass
+
+        mode_key = self._first_present_key(["mode_value", "mode", "tts_mode", "mode_checkbox_group"], set(param_names))
+        upload_key = self._first_present_key(["prompt_wav_upload", "prompt_wav", "ref_wav", "reference_audio"], set(param_names))
+        record_key = self._first_present_key(["prompt_wav_record", "record_audio"], set(param_names))
+        stream_key = self._first_present_key(["stream", "is_stream", "streaming"], set(param_names))
+
+        mode_choices = []
+        if mode_key:
+            mode_choices = self._literal_choices_from_type(meta.get(mode_key, {}).get("python_type"))
+        candidate_modes = self._mode_candidates(mode_choices) if mode_choices else [payload.get(mode_key)]
+
+        stream_variants = [False]
+        if stream_key:
+            stream_choices = self._literal_choices_from_type(meta.get(stream_key, {}).get("python_type"))
+            if "False" in stream_choices:
+                stream_variants.append("False")
+
+        record_variants = []
+        if record_key:
+            record_variants = [payload.get(record_key), None]
+            if record_variants[0] is None:
+                record_variants = [None, ref_file]
+        else:
+            record_variants = [None]
+
+        last_error = None
+        attempt = 0
+        for mode_value in candidate_modes:
+            for record_value in record_variants:
+                for stream_value in stream_variants:
+                    call_payload = dict(payload)
+                    if mode_key and mode_value is not None:
+                        call_payload[mode_key] = mode_value
+                    if upload_key and upload_key not in call_payload:
+                        call_payload[upload_key] = ref_file
+                    if record_key:
+                        call_payload[record_key] = record_value
+                    if stream_key:
+                        call_payload[stream_key] = stream_value
+                    attempt += 1
+                    try:
+                        if log_fn:
+                            log_fn(
+                                f\"🧪 CosyVoice attempt #{attempt}: mode={call_payload.get(mode_key, '')}, \"
+                                f\"record={'set' if call_payload.get(record_key) else 'none'}, stream={call_payload.get(stream_key)}\"
+                            )
+                        result = client.predict(api_name=api_name, **call_payload)
+                        wav = extract_audio_to_wav_file(result, log_fn)
+                        if wav and os.path.exists(wav):
+                            return wav
+                    except Exception as e:
+                        last_error = e
+                        if log_fn:
+                            log_fn(f\"⚠️ CosyVoice attempt #{attempt} failed: {e}\")
+
+        if last_error is not None:
+            raise last_error
+        return None
 
     def prefetch(self, text, speed=1.0, log_fn=None):
         clean_text = normalize_dialogue_text(text, apply_casing=True, apply_repair=True)
