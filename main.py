@@ -1391,7 +1391,7 @@ class GeminiTTSBackend(BaseTTS):
             }
             
             headers = {"Content-Type": "application/json"}
-            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response = requests.post(url, headers=headers, json=payload, timeout=120)
             
             if response.status_code != 200:
                 if log_fn: log_fn(f"❌ Gemini API Error: {response.text}")
@@ -2100,17 +2100,11 @@ class CalibrationOverlay(tk.Toplevel):
         self.title("Read Zone Calibration Frame")
         self.overrideredirect(True)
         self.attributes("-topmost", True)
-        self.attributes("-alpha", 0.35)
+        self.attributes("-alpha", 0.15)
         self.configure(bg="#22c55e")
         
         self.canvas = tk.Canvas(self, bg="#22c55e", highlightthickness=3, highlightbackground="#16a34a")
         self.canvas.pack(fill="both", expand=True)
-
-        lbl = tk.Label(
-            self, text="📖 MANHWA READ ZONE (Everything inside this frame is read by OCR)",
-            bg="#22c55e", fg="#ffffff", font=("Helvetica", 11, "bold")
-        )
-        lbl.place(relx=0.5, rely=0.1, anchor="center")
 
         self.update_position()
 
