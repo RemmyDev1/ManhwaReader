@@ -2547,7 +2547,7 @@ class ManhwaReaderApp(ctk.CTk):
         tts_selection = self.seg_tts.get()
         if "CosyVoice" in tts_selection:
             backend = "cosyvoice"
-        elif "OmniVoice" in tts_selection:
+        elif "Gemini" in tts_selection:
             backend = "omnivoice"
         elif "Edge-TTS" in tts_selection:
             backend = "edgetts"
