@@ -251,51 +251,6 @@ def correct_manhwa_ocr_text(text: str) -> str:
 def ocr_agreement_key(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
-def segment_concatenated_word(word: str) -> str:
-    """
-    Splits compound glued words from manhwa glow OCR (e.g. 'ordereditdonefor' -> 'ordered it done for').
-    Handles glued contractions and strips outer OCR bracket artifacts (l, 1, i, t).
-    """
-    # 1. Glued contractions (e.g. "it'snot" -> "it's not", "didn'tcall" -> "didn't call")
-    word = re.sub(r"(n't|'s|'re|'ve|'ll|'d|'m)([a-zA-Z]{2,})", r"\1 \2", word, flags=re.IGNORECASE)
-
-    clean_w = re.sub(r'[^a-zA-Z]', '', word).lower()
-    if len(clean_w) < 4 or clean_w in LONG_VALID_WORDS:
-        return word
-
-    # DP segmenter maximizing sum of squared subword lengths
-    def _dp_segment(s):
-        n = len(s)
-        dp = [(-1, []) for _ in range(n + 1)]
-        dp[0] = (0, [])
-        for i in range(1, n + 1):
-            for j in range(0, i):
-                sub = s[j:i]
-                if dp[j][0] != -1 and sub in COMMON_ENGLISH_WORDS:
-                    if len(sub) == 1 and sub not in ('a', 'i'):
-                        continue
-                    score = dp[j][0] + (len(sub) ** 2)
-                    if score > dp[i][0]:
-                        dp[i] = (score, dp[j][1] + [sub])
-        return dp[n]
-
-    res_score, res_tokens = _dp_segment(clean_w)
-    if res_score > 0 and len(res_tokens) >= 2:
-        return " ".join(res_tokens)
-
-    # 2. Check for bracket letter artifacts (e.g. [WEALTHY MAGNATE] -> 'lwealthymagnatet')
-    for p_len in (0, 1):
-        for s_len in (0, 1):
-            if p_len == 0 and s_len == 0:
-                continue
-            sub_w = clean_w[p_len : len(clean_w) - s_len]
-            if len(sub_w) >= 4:
-                sub_score, sub_tokens = _dp_segment(sub_w)
-                if sub_score > 0 and len(sub_tokens) >= 1:
-                    return " ".join(sub_tokens)
-
-    return word
-
 def repair_manhwa_ocr_text(text: str) -> str:
     """
     Auto-corrects common OCR phonetic & character manglings in comic/manhwa typography:
@@ -440,21 +395,7 @@ def repair_manhwa_ocr_text(text: str) -> str:
     for pattern, repl in substitutions:
         t = re.sub(pattern, repl, t, flags=re.IGNORECASE)
 
-    # Dynamic compound word segmentation on any remaining run-together tokens
-    tokens = t.split()
-    segmented_tokens = []
-    for tok in tokens:
-        # Preserve punctuation attached to token
-        prefix = re.match(r'^[^\w]+', tok)
-        suffix = re.search(r'[^\w]+$', tok)
-        p_str = prefix.group(0) if prefix else ""
-        s_str = suffix.group(0) if suffix else ""
-        core = tok[len(p_str): len(tok) - len(s_str)] if s_str else tok[len(p_str):]
-        
-        seg = segment_concatenated_word(core)
-        segmented_tokens.append(f"{p_str}{seg}{s_str}")
-
-    return " ".join(segmented_tokens)
+    return t
 
 def clean_tts_phonetics_and_dashes(text: str) -> str:
     """
@@ -469,7 +410,8 @@ def clean_tts_phonetics_and_dashes(text: str) -> str:
     
     t = text
     # 1. Merge hyphen-split words from line wraps (e.g. 're- quests' -> 'requests')
-    t = re.sub(r'(\b[a-zA-Z]{2,})\s*-\s*([a-zA-Z]{2,}\b)', r'\1\2', t)
+    # We require at least one space after the hyphen so we don't accidentally merge normal hyphenated words like 'spider-man' or OCR'd M-dashes
+    t = re.sub(r'(\b[a-zA-Z]{2,})-\s+([a-zA-Z]{2,}\b)', r'\1\2', t)
 
     # 2. Fix broken contractions with spaces (e.g. 'don t' -> "don't", 'i m' -> "I'm")
     contraction_fixes = [
@@ -503,10 +445,8 @@ def clean_tts_phonetics_and_dashes(text: str) -> str:
     for pat, rep in contraction_fixes:
         t = re.sub(pat, rep, t, flags=re.IGNORECASE)
 
-    # 3. Convert dialogue dashes/hyphens/ellipses to smooth pauses (commas)
-    # Instead of leaving raw '-' which makes OmniVoice say "dash" or stutter
-    t = re.sub(r'(\s*[-—–]+\s*)+', ', ', t)
-    t = re.sub(r'(\.\.\.+|\…+)', ', ', t)
+    # 3. (REMOVED) We no longer convert dashes/ellipses to commas, 
+    # because Gemini and modern TTS engines handle M-dashes and ellipses beautifully natively.
 
     # 4. Remove all non-speech symbols
     t = re.sub(r'[~^#@*_\[\]{}\\\/<>\$|•►★☆♪♫="`]+', ' ', t)
@@ -520,8 +460,8 @@ def clean_tts_phonetics_and_dashes(text: str) -> str:
     t = re.sub(r'\.\s*\.+', '. ', t)
     t = re.sub(r'\s+', ' ', t).strip()
 
-    # 6. Remove leading/trailing non-word characters
-    t = re.sub(r'^[^\w\'"]+|[^\w\.\!\?\'"]+$', '', t)
+    # 6. Remove leading/trailing non-word characters (but preserve valid punctuation)
+    t = re.sub(r'^[^\w\'"—]+|[^\w\.\!\?\'"—]+$', '', t)
     return t.strip()
 
 def prune_tts_repetition_loops(text: str, max_ngram: int = 4) -> str:
@@ -604,7 +544,7 @@ def normalize_dialogue_text(text: str, apply_casing: bool = True, apply_repair: 
     clean = text.strip()
     clean = re.sub(r'[\r\n\t]+', ' ', clean)
     clean = re.sub(r'\s+', ' ', clean)
-    clean = clean.replace('|', '').replace('—', ' - ').replace('..', '.')
+    clean = clean.replace('|', '').replace('..', '.')
 
     if not clean:
         return ""
