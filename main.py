@@ -2037,16 +2037,88 @@ class CalibrationOverlay(tk.Toplevel):
     def __init__(self, master, engine):
         super().__init__(master)
         self.engine = engine
+        self.master_app = master
         self.title("Read Zone Calibration Frame")
         self.overrideredirect(True)
         self.attributes("-topmost", True)
-        self.attributes("-alpha", 0.15)
+        self.attributes("-alpha", 0.25)
         self.configure(bg="#22c55e")
         
-        self.canvas = tk.Canvas(self, bg="#22c55e", highlightthickness=3, highlightbackground="#16a34a")
+        self.canvas = tk.Canvas(self, bg="#22c55e", highlightthickness=3, highlightbackground="#16a34a", cursor="fleur")
         self.canvas.pack(fill="both", expand=True)
 
+        self.lbl = tk.Label(
+            self.canvas, text="DRAG to move\nDrag bottom-right corner to RESIZE",
+            bg="#22c55e", fg="#ffffff", font=("Helvetica", 11, "bold")
+        )
+        self.lbl.place(relx=0.5, rely=0.5, anchor="center")
+        
+        self.grip = tk.Frame(self, bg="#16a34a", cursor="sizing")
+        self.grip.place(relx=1.0, rely=1.0, anchor="se", width=25, height=25)
+        
+        for w in (self.canvas, self.lbl):
+            w.bind("<ButtonPress-1>", self.start_move)
+            w.bind("<B1-Motion>", self.do_move)
+            w.bind("<ButtonRelease-1>", self.stop_action)
+
+        self.grip.bind("<ButtonPress-1>", self.start_resize)
+        self.grip.bind("<B1-Motion>", self.do_resize)
+        self.grip.bind("<ButtonRelease-1>", self.stop_action)
+
         self.update_position()
+        self._x = 0
+        self._y = 0
+
+    def start_move(self, event):
+        self._x = event.x
+        self._y = event.y
+
+    def do_move(self, event):
+        x = self.winfo_x() + (event.x - self._x)
+        y = self.winfo_y() + (event.y - self._y)
+        self.geometry(f"+{x}+{y}")
+
+    def start_resize(self, event):
+        self._x = event.x
+        self._y = event.y
+
+    def do_resize(self, event):
+        w = self.winfo_width() + (event.x - self._x)
+        h = self.winfo_height() + (event.y - self._y)
+        w = max(150, w)
+        h = max(100, h)
+        self.geometry(f"{w}x{h}")
+        self._x = event.x
+        self._y = event.y
+
+    def stop_action(self, event):
+        x = self.winfo_x()
+        y = self.winfo_y()
+        w = self.winfo_width()
+        h = self.winfo_height()
+        
+        with mss.mss() as sct:
+            monitors = sct.monitors
+            m_idx = min(max(1, self.engine.config.get("monitor_index", 1)), len(monitors) - 1)
+            mon = monitors[m_idx]
+            
+            sw = mon["width"]
+            sh = mon["height"]
+            left_offset = mon["left"]
+            top_offset = mon["top"]
+            
+            left_pct = max(0, min(100, int((x - left_offset) / sw * 100)))
+            top_pct = max(0, min(100, int((y - top_offset) / sh * 100)))
+            width_pct = max(5, min(100, int(w / sw * 100)))
+            height_pct = max(5, min(100, int(h / sh * 100)))
+            
+            self.engine.config["read_zone_left"] = left_pct
+            self.engine.config["read_zone_top"] = top_pct
+            self.engine.config["read_zone_width"] = width_pct
+            self.engine.config["read_zone_height"] = height_pct
+            
+            self.master_app.config.update(self.engine.config)
+            save_config(self.master_app.config)
 
     def update_position(self):
         with mss.mss() as sct:
@@ -2426,41 +2498,10 @@ class ManhwaReaderApp(ctk.CTk):
         scroll.pack(fill="both", expand=True, padx=16, pady=12)
 
         ctk.CTkLabel(scroll, text="Screen Read Zone Calibration", font=("Helvetica", 13, "bold")).pack(anchor="w", pady=(8, 4))
-        ctk.CTkLabel(scroll, text="Adjust the capture box where speech bubbles appear on your display.", font=("Helvetica", 11), text_color="#94a3b8").pack(anchor="w", pady=(0, 12))
+        ctk.CTkLabel(scroll, text="Click 'Show Visual Read Zone Frame' below to activate the green calibration box.", font=("Helvetica", 11), text_color="#94a3b8").pack(anchor="w", pady=(0, 4))
+        ctk.CTkLabel(scroll, text="You can drag the box directly on your screen to move it, and drag the bottom-right corner to resize it.", font=("Helvetica", 11, "italic"), text_color="#cbd5e1").pack(anchor="w", pady=(0, 12))
 
-        ctk.CTkLabel(scroll, text="Top Offset (% from top of screen)", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(8, 2))
-        self.lbl_top_val = ctk.CTkLabel(scroll, text=f"{self.config.get('read_zone_top', 20)}%", font=("Helvetica", 11), text_color="#38bdf8")
-        self.lbl_top_val.pack(anchor="w")
-        self.sld_top = ctk.CTkSlider(
-            scroll, from_=0, to=90, number_of_steps=90,
-            command=self.on_zone_slider_change
-        )
-        self.sld_top.set(self.config.get("read_zone_top", 20))
-        self.sld_top.pack(fill="x", pady=4)
-
-        ctk.CTkLabel(scroll, text="Zone Height (% of screen)", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(12, 2))
-        self.lbl_height_val = ctk.CTkLabel(scroll, text=f"{self.config.get('read_zone_height', 55)}%", font=("Helvetica", 11), text_color="#38bdf8")
-        self.lbl_height_val.pack(anchor="w")
-        self.sld_height = ctk.CTkSlider(
-            scroll, from_=10, to=95, number_of_steps=85,
-            command=self.on_zone_slider_change
-        )
-        self.sld_height.set(self.config.get("read_zone_height", 55))
-        self.sld_height.pack(fill="x", pady=4)
-
-        ctk.CTkButton(scroll, text="📐 Show / Hide Visual Read Zone Frame", command=self.toggle_calibration, fg_color="#334155").pack(pady=16, fill="x")
-
-    def on_zone_slider_change(self, _=None):
-        top_val = int(self.sld_top.get())
-        height_val = int(self.sld_height.get())
-        self.lbl_top_val.configure(text=f"{top_val}%")
-        self.lbl_height_val.configure(text=f"{height_val}%")
-        self.config["read_zone_top"] = top_val
-        self.config["read_zone_height"] = height_val
-        self.engine.update_config(self.config)
-        save_config(self.config)
-        if self.overlay_window:
-            self.overlay_window.update_position()
+        ctk.CTkButton(scroll, text="📐 Show / Hide Visual Read Zone Frame", command=self.toggle_calibration, fg_color="#334155", height=40).pack(pady=16, fill="x")
 
     def on_mode_change(self, mode_str):
         new_mode = "manhwa" if "Manhwa" in mode_str else "book"
