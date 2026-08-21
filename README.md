@@ -10,16 +10,16 @@ The TTS engine has been upgraded to support the Gemini API.
    pip install -r requirements.txt
    ```
 
-2. Set your Gemini API key in your environment variables:
-   * **Windows Command Prompt:** `set GEMINI_API_KEY=your_key_here`
-   * **Windows PowerShell:** `$env:GEMINI_API_KEY="your_key_here"`
-   * **Mac/Linux:** `export GEMINI_API_KEY="your_key_here"`
+2. Set your Gemini API key securely:
+   * Create a new file named `.env` in the same folder as `main.py`
+   * Open it in a text editor and add: `GEMINI_API_KEY=your_key_here`
+   * *(Note: The `.env` file is ignored by git, keeping your key safe!)*
 
 3. Run the app:
    ```bash
    python main.py
    ```
-   (Or run `run.bat` on Windows)
+   (Or double-click `run.bat` on Windows)
 
 ## Usage
 1. Open the settings panel and select **"Gemini API (GenAI)"** as your Voice Engine Backend.

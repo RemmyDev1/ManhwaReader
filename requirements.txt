@@ -17,3 +17,4 @@ rapidocr-onnxruntime; python_version < '3.13'
 onnxruntime; python_version < '3.13'
 
 google-genai>=0.1.0
+python-dotenv>=1.0.0

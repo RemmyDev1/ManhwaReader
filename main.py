@@ -17,6 +17,8 @@ Tech Stack:
 """
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
 import importlib
 import sys
 import time
