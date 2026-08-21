@@ -1348,6 +1348,79 @@ class CosyVoiceTTS(BaseTTS):
         return bool(wav_file and play_wav_blocking(wav_file, log_fn))
 
 
+class GeminiTTSBackend(BaseTTS):
+    """Google Gemini AI TTS Backend (gemini-3.1-flash-tts-preview)"""
+    def __init__(self, voice_name="Aoede"):
+        self.voice_name = voice_name
+        
+    def synthesize_and_play_blocking(self, text: str, speed: float = 1.0, log_fn=None) -> bool:
+        clean_text = normalize_dialogue_text(text, apply_casing=True)
+        if not clean_text:
+            return True
+            
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            if log_fn:
+                log_fn("❌ GEMINI_API_KEY environment variable not set. Please set it to use Gemini TTS.")
+            return False
+
+        if log_fn:
+            log_fn(f"🎙️ Synthesizing Gemini Voice ({self.voice_name}): '{clean_text}'...")
+
+        try:
+            import requests
+            import base64
+            import wave
+            import io
+            
+            url = f"https://generativelanguage.googleapis.com/v1alpha/models/gemini-3.1-flash-tts-preview:generateContent?key={api_key}"
+            payload = {
+                "contents": [{"parts": [{"text": clean_text}]}],
+                "generationConfig": {
+                    "responseModalities": ["AUDIO"],
+                    "speechConfig": {
+                        "voiceConfig": {
+                            "prebuiltVoiceConfig": {
+                                "voiceName": self.voice_name
+                            }
+                        }
+                    }
+                }
+            }
+            
+            headers = {"Content-Type": "application/json"}
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            
+            if response.status_code != 200:
+                if log_fn: log_fn(f"❌ Gemini API Error: {response.text}")
+                return False
+                
+            data = response.json()
+            if "candidates" in data and len(data["candidates"]) > 0:
+                parts = data["candidates"][0].get("content", {}).get("parts", [])
+                for part in parts:
+                    if "inlineData" in part and "data" in part["inlineData"]:
+                        b64_audio = part["inlineData"]["data"]
+                        pcm_data = base64.b64decode(b64_audio)
+                        
+                        # Wrap raw 24kHz PCM into a standard WAV file
+                        wav_io = io.BytesIO()
+                        with wave.open(wav_io, 'wb') as wav_file:
+                            wav_file.setnchannels(1)      # Mono
+                            wav_file.setsampwidth(2)      # 16-bit
+                            wav_file.setframerate(24000)  # Gemini default is 24kHz
+                            wav_file.writeframes(pcm_data)
+                            
+                        wav_bytes = wav_io.getvalue()
+                        return play_wav_blocking(wav_bytes, log_fn)
+                        
+            if log_fn: log_fn("❌ No audio data returned from Gemini.")
+            return False
+            
+        except Exception as e:
+            if log_fn: log_fn(f"❌ Gemini TTS Error: {e}")
+        return False
+
 class EdgeTTSBackend(BaseTTS):
     """Ultra-realistic Microsoft Neural HD Studio voices (Christopher, Guy, Eric, Jenny, etc.). Zero hallucination."""
     def __init__(self, voice_name="en-US-ChristopherNeural"):
@@ -1781,15 +1854,7 @@ class ScreenReaderEngine:
     def init_tts(self):
         backend = self.config.get("tts_backend", "omnivoice")
         if backend == "omnivoice":
-            self.tts = OmniVoiceTTS(
-                server_url=self.config.get("omnivoice_url", "http://127.0.0.1:8001"),
-                ref_clip=self.config.get("omnivoice_ref_clip", "audio.wav"),
-                ref_text=self.config.get("omnivoice_ref_text", ""),
-                language=self.config.get("omnivoice_language", "English"),
-                duration_scale=float(self.config.get("omnivoice_duration_scale", 1.45)),
-                allow_fallback=self.config.get("allow_pyttsx3_fallback", False),
-                log_fn=self.log_fn
-            )
+            self.tts = GeminiTTSBackend(voice_name="Aoede")
         elif backend == "cosyvoice":
             self.tts = CosyVoiceTTS(
                 server_url=self.config.get("cosyvoice_url", "http://127.0.0.1:50000"),
@@ -2290,14 +2355,14 @@ class ManhwaReaderApp(ctk.CTk):
 
         ctk.CTkLabel(scroll, text="Voice Engine Backend", font=("Helvetica", 13, "bold")).pack(anchor="w", pady=(8, 4))
         self.seg_tts = ctk.CTkSegmentedButton(
-            scroll, values=["CosyVoice (Local Clone)", "OmniVoice (Voice Clone)", "Edge-TTS (Studio HD)", "Local PyTTSx3"],
+            scroll, values=["CosyVoice (Local Clone)", "Gemini API (GenAI)", "Edge-TTS (Studio HD)", "Local PyTTSx3"],
             command=self.save_and_apply
         )
         current_tts = self.config.get("tts_backend")
         if current_tts == "cosyvoice":
             self.seg_tts.set("CosyVoice (Local Clone)")
         elif current_tts == "omnivoice":
-            self.seg_tts.set("OmniVoice (Voice Clone)")
+            self.seg_tts.set("Gemini API (GenAI)")
         elif current_tts == "edgetts":
             self.seg_tts.set("Edge-TTS (Studio HD)")
         else:
