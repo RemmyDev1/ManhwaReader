@@ -28,7 +28,7 @@ The TTS engine has been upgraded to support the Gemini API.
 
 # ALL RIGHTS RESERVED - CUSTOM PROPRIETARY LICENSE
 
-Copyright (c) [Year] [Your Name]. All Rights Reserved.
+Copyright (c) 2026 Kariem. All Rights Reserved.
 
 This software and its source code are provided for private, personal use only. By accessing this repository, you agree to the following terms:
 
