@@ -87,17 +87,13 @@ DEFAULT_CONFIG = {
     "normalize_casing": True,        # Convert screaming ALL-CAPS into natural spoken sentence casing
     
     # TTS Backend Settings
-    "tts_backend": "omnivoice",      # "omnivoice", "cosyvoice", "edgetts", "pyttsx3"
-    "omnivoice_url": "http://127.0.0.1:8001",
-    "omnivoice_ref_clip": "audio.wav",
-    "omnivoice_ref_text": "",
-    "omnivoice_language": "English",
-    "omnivoice_duration_scale": 1.0, # 1.0x tight duration prevents looping, rereading, or trailing stutter
+    "tts_backend": "gemini",         # "gemini", "edgetts", "cosyvoice"
     "cosyvoice_url": "http://127.0.0.1:50000",
+    "cosyvoice_ref_clip": "audio.wav",
+    "cosyvoice_ref_text": "",
     "cosyvoice_mode": "zero_shot",
-    "enable_omnivoice_prefetch": True,
+    "enable_gemini_prefetch": True,
     "max_tts_queue": 2,
-    "allow_pyttsx3_fallback": False, # Prevent silent robotic fallback
     "edge_tts_voice": "en-US-ChristopherNeural", # Studio natural voice
     "speech_speed": 1.0,
     "dialogue_pause_sec": 0.4,
@@ -109,6 +105,12 @@ def load_config():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+                if cfg.get("tts_backend") == "omnivoice":
+                    cfg["tts_backend"] = "gemini"
+                if "omnivoice_ref_clip" in cfg and "cosyvoice_ref_clip" not in cfg:
+                    cfg["cosyvoice_ref_clip"] = cfg["omnivoice_ref_clip"]
+                if "omnivoice_ref_text" in cfg and "cosyvoice_ref_text" not in cfg:
+                    cfg["cosyvoice_ref_text"] = cfg["omnivoice_ref_text"]
                 merged = DEFAULT_CONFIG.copy()
                 merged.update(cfg)
                 return merged
@@ -748,215 +750,6 @@ class BaseTTS(ABC):
     @abstractmethod
     def synthesize_and_play_blocking(self, text: str, speed: float = 1.0, log_fn=None) -> bool:
         pass
-
-class OmniVoiceTTS(BaseTTS):
-    def __init__(self, server_url, ref_clip, ref_text="", language="English", duration_scale=1.45, allow_fallback=False, log_fn=None):
-        self.server_url = server_url.rstrip("/")
-        self.ref_clip = ref_clip
-        self.ref_text = ref_text
-        self.language = language
-        self.duration_scale = float(duration_scale)
-        self.allow_fallback = allow_fallback
-        self.gradio_client = None
-        self.api_schema = None
-        self.connecting = False
-        self.last_connect_time = 0
-        self._cache_lock = threading.Lock()
-        self._prefetch_cache = {}
-        self._prefetch_inflight = set()
-        self._max_prefetch_cache = 6
-        threading.Thread(target=self._async_init_gradio, args=(log_fn,), daemon=True).start()
-
-    def _async_init_gradio(self, log_fn=None):
-        if self.connecting:
-            return
-        self.connecting = True
-        try:
-            from gradio_client import Client
-            self.gradio_client = Client(self.server_url)
-            msg = f"Connected to OmniVoice Gradio at {self.server_url}"
-            print(f"[OmniVoice] {msg}")
-            if log_fn: log_fn(f"📡 {msg}")
-
-            try:
-                self.api_schema = self.gradio_client.view_api(return_format="dict")
-                named = self.api_schema.get("named_endpoints", {})
-                if log_fn:
-                    log_fn(f"📋 Gradio API ready with endpoints: {list(named.keys())}")
-            except Exception:
-                pass
-        except Exception as e:
-            self.gradio_client = None
-            err_msg = f"OmniVoice Gradio connection failed at {self.server_url}: {e}"
-            print(f"[OmniVoice] {err_msg}")
-            if log_fn: log_fn(f"⚠️ {err_msg}")
-        finally:
-            self.connecting = False
-            self.last_connect_time = time.time()
-
-    def inspect_api(self, log_fn=None):
-        """Deep inspection of the OmniVoice / Gradio API."""
-        if log_fn: log_fn(f"🔍 Inspecting OmniVoice Server at: {self.server_url} ...")
-        
-        try:
-            r = requests.get(self.server_url, timeout=5.0)
-            if log_fn: log_fn(f"🌐 HTTP Status: {r.status_code} ({'OK' if r.status_code < 400 else 'Error'})")
-        except Exception as e:
-            if log_fn: log_fn(f"❌ Server unreachable: {e}")
-            return
-
-        norm_ref = os.path.abspath(os.path.normpath(self.ref_clip)) if self.ref_clip else ""
-        if norm_ref and os.path.exists(norm_ref):
-            size_mb = round(os.path.getsize(norm_ref) / (1024 * 1024), 2)
-            if log_fn: log_fn(f"📁 Reference Audio Clip: '{os.path.basename(norm_ref)}' ({size_mb} MB) [VERIFIED EXISTS ✅]")
-        else:
-            if log_fn: log_fn(f"❌ Reference Audio Clip NOT found on disk at: '{self.ref_clip}'. Please browse and select your .wav recording!")
-
-        try:
-            from gradio_client import Client
-            client = Client(self.server_url)
-            schema = client.view_api(return_format="dict")
-            named = schema.get("named_endpoints", {})
-            if log_fn:
-                log_fn(f"📋 Available Named Endpoints: {list(named.keys())}")
-                if "/_clone_fn" in named:
-                    log_fn("🎯 Target Endpoint '/_clone_fn' is READY for Voice Cloning!")
-        except Exception as ge:
-            if log_fn: log_fn(f"ℹ️ Gradio Client inspection note: {ge}")
-
-    def _ensure_gradio_client(self, log_fn=None):
-        if self.gradio_client is not None:
-            return self.gradio_client
-        try:
-            from gradio_client import Client
-            self.gradio_client = Client(self.server_url)
-            return self.gradio_client
-        except Exception as e:
-            if log_fn:
-                log_fn(f"❌ OmniVoice Gradio connection failed: {e}")
-            return None
-
-    def _build_ref_audio_payload(self):
-        ref_path = None
-        ref_payload = None
-        if self.ref_clip:
-            norm_ref = os.path.abspath(os.path.normpath(self.ref_clip))
-            if os.path.exists(norm_ref):
-                ref_path = norm_ref
-                try:
-                    from gradio_client import handle_file
-                    ref_payload = handle_file(ref_path)
-                except Exception:
-                    ref_payload = ref_path
-        return ref_path, ref_payload
-
-    def _cache_key(self, clean_text: str, speed: float) -> str:
-        return f"{clean_text.lower()}|{round(float(speed), 3)}"
-
-    def _predict_to_wav(self, clean_text: str, speed: float, log_fn=None):
-        client = self._ensure_gradio_client(log_fn=log_fn)
-        if client is None:
-            return None
-
-        ref_path, ref_payload = self._build_ref_audio_payload()
-        est_duration = estimate_speech_duration(clean_text, speed=speed, duration_scale=self.duration_scale)
-        audio_input = ref_payload if ref_payload is not None else ref_path
-
-        raw_result = client.predict(
-            text=clean_text,
-            lang=self.language if self.language in ["English", "Auto", "Japanese", "Korean", "Chinese", "Spanish", "French", "German"] else "English",
-            ref_aud=audio_input,
-            ref_text=self.ref_text or "",
-            instruct="",
-            ns=32.0,
-            gs=2.2,
-            dn=True,
-            sp=float(speed),
-            du=float(est_duration),
-            pp=True,
-            po=True,
-            api_name="/_clone_fn"
-        )
-
-        return extract_audio_to_wav_file(raw_result, log_fn)
-
-    def prefetch(self, text: str, speed: float = 1.0, log_fn=None):
-        clean_text = normalize_dialogue_text(text, apply_casing=True, apply_repair=True)
-        if not clean_text:
-            return
-        key = self._cache_key(clean_text, speed)
-
-        with self._cache_lock:
-            cached = self._prefetch_cache.get(key)
-            if cached and os.path.exists(cached):
-                return
-            if key in self._prefetch_inflight:
-                return
-            self._prefetch_inflight.add(key)
-
-        def _prefetch_worker():
-            wav_file = None
-            try:
-                wav_file = self._predict_to_wav(clean_text, speed, log_fn=None)
-                if wav_file and os.path.exists(wav_file):
-                    with self._cache_lock:
-                        self._prefetch_cache[key] = wav_file
-                        while len(self._prefetch_cache) > self._max_prefetch_cache:
-                            oldest_key = next(iter(self._prefetch_cache))
-                            old_path = self._prefetch_cache.pop(oldest_key, None)
-                            if old_path and old_path != wav_file and os.path.exists(old_path):
-                                try:
-                                    os.remove(old_path)
-                                except Exception:
-                                    pass
-            except Exception:
-                pass
-            finally:
-                with self._cache_lock:
-                    self._prefetch_inflight.discard(key)
-
-        threading.Thread(target=_prefetch_worker, daemon=True).start()
-
-    def synthesize_and_play_blocking(self, text: str, speed: float = 1.0, log_fn=None) -> bool:
-        clean_text = normalize_dialogue_text(text, apply_casing=True, apply_repair=True)
-        if not clean_text or len(clean_text.split()) == 0:
-            return True
-
-        words = clean_text.split()
-        if log_fn:
-            log_fn(f"🎙️ Synthesizing Voice Clone: '{clean_text}' ({len(words)} words)...")
-
-        key = self._cache_key(clean_text, speed)
-        wav_file = None
-        with self._cache_lock:
-            cached = self._prefetch_cache.pop(key, None)
-            if cached and os.path.exists(cached):
-                wav_file = cached
-
-        if wav_file and log_fn:
-            log_fn("⚡ Using prefetched OmniVoice audio (low latency).")
-
-        if wav_file is None:
-            try:
-                wav_file = self._predict_to_wav(clean_text, speed, log_fn=log_fn)
-            except Exception as e:
-                err_msg = str(e)
-                if log_fn:
-                    log_fn(f"❌ OmniVoice Error: {err_msg}")
-                wav_file = None
-
-        if wav_file and os.path.exists(wav_file):
-            return play_wav_blocking(wav_file, log_fn)
-
-        if self.allow_fallback:
-            if log_fn: log_fn("⚠️ Fallback to robotic Windows PyTTSx3...")
-            fallback = LocalPyttsx3TTS()
-            return fallback.synthesize_and_play_blocking(clean_text, speed, log_fn)
-        else:
-            if log_fn:
-                log_fn("🛑 Voice Clone failed and robotic fallback is disabled. Check server status or switch to Edge-TTS!")
-            return False
-
 
 class CosyVoiceTTS(BaseTTS):
     """Local CosyVoice Gradio client using zero-shot reference-voice cloning."""
@@ -1794,14 +1587,14 @@ class ScreenReaderEngine:
         self.ocr = ResilientOCR(preference=pref, log_fn=self.log_fn)
 
     def init_tts(self):
-        backend = self.config.get("tts_backend", "omnivoice")
-        if backend == "omnivoice":
+        backend = self.config.get("tts_backend", "gemini")
+        if backend == "gemini":
             self.tts = GeminiTTSBackend(voice_name="Aoede")
         elif backend == "cosyvoice":
             self.tts = CosyVoiceTTS(
                 server_url=self.config.get("cosyvoice_url", "http://127.0.0.1:50000"),
-                ref_clip=self.config.get("omnivoice_ref_clip", "audio.wav"),
-                ref_text=self.config.get("omnivoice_ref_text", ""),
+                ref_clip=self.config.get("cosyvoice_ref_clip", "audio.wav"),
+                ref_text=self.config.get("cosyvoice_ref_text", ""),
                 mode=self.config.get("cosyvoice_mode", "zero_shot"),
                 log_fn=self.log_fn
             )
@@ -1810,7 +1603,7 @@ class ScreenReaderEngine:
                 voice_name=self.config.get("edge_tts_voice", "en-US-ChristopherNeural")
             )
         else:
-            self.tts = LocalPyttsx3TTS()
+            self.tts = GeminiTTSBackend(voice_name="Aoede")
         self.prefetch_hint_text = ""
 
     def _init_tts_worker(self):
@@ -1973,8 +1766,8 @@ class ScreenReaderEngine:
                     time.sleep(0.035)
 
                 if (
-                    self.config.get("enable_omnivoice_prefetch", True)
-                    and isinstance(self.tts, (OmniVoiceTTS, CosyVoiceTTS))
+                    self.config.get("enable_gemini_prefetch", True)
+                    and hasattr(self.tts, "prefetch")
                     and self.stabilizer.candidate_text
                     and self.stabilizer.stable_frames >= 2
                     and not finalized_dialogue
@@ -2046,20 +1839,13 @@ class CalibrationOverlay(tk.Toplevel):
         
         self.canvas = tk.Canvas(self, bg="#22c55e", highlightthickness=3, highlightbackground="#16a34a", cursor="fleur")
         self.canvas.pack(fill="both", expand=True)
-
-        self.lbl = tk.Label(
-            self.canvas, text="DRAG to move\nDrag bottom-right corner to RESIZE",
-            bg="#22c55e", fg="#ffffff", font=("Helvetica", 11, "bold")
-        )
-        self.lbl.place(relx=0.5, rely=0.5, anchor="center")
         
         self.grip = tk.Frame(self, bg="#16a34a", cursor="sizing")
         self.grip.place(relx=1.0, rely=1.0, anchor="se", width=25, height=25)
         
-        for w in (self.canvas, self.lbl):
-            w.bind("<ButtonPress-1>", self.start_move)
-            w.bind("<B1-Motion>", self.do_move)
-            w.bind("<ButtonRelease-1>", self.stop_action)
+        self.canvas.bind("<ButtonPress-1>", self.start_move)
+        self.canvas.bind("<B1-Motion>", self.do_move)
+        self.canvas.bind("<ButtonRelease-1>", self.stop_action)
 
         self.grip.bind("<ButtonPress-1>", self.start_resize)
         self.grip.bind("<B1-Motion>", self.do_resize)
@@ -2162,7 +1948,7 @@ class ManhwaReaderApp(ctk.CTk):
         # Update initial status label
         ocr_name = self.engine.ocr.engine_type if self.engine.ocr else 'Auto'
         self.lbl_status.configure(
-            text=f"OCR: {ocr_name}\nTTS: {self.config.get('tts_backend')}\nVoice: {os.path.basename(self.config.get('omnivoice_ref_clip', '')) or 'None'}"
+            text=f"OCR: {ocr_name}\nTTS: {self.config.get('tts_backend')}\nVoice: {os.path.basename(self.config.get('cosyvoice_ref_clip', '')) or 'None'}"
         )
         self.log("🚀 V-Reader Pro initialized & ready.")
 
@@ -2236,11 +2022,6 @@ class ManhwaReaderApp(ctk.CTk):
         )
         btn_test_ocr.pack(fill="x", padx=12, pady=6)
 
-        btn_inspect_voice = ctk.CTkButton(
-            left_panel, text="🔍 Inspect OmniVoice Server",
-            command=self.inspect_omnivoice, fg_color="#0284c7", hover_color="#0369a1"
-        )
-        btn_inspect_voice.pack(fill="x", padx=12, pady=6)
 
         btn_test_tts = ctk.CTkButton(
             left_panel, text="🔊 Test Voice Playback",
@@ -2258,7 +2039,7 @@ class ManhwaReaderApp(ctk.CTk):
 
         self.lbl_status = ctk.CTkLabel(
             left_panel,
-            text=f"OCR: Initializing...\nTTS: {self.config.get('tts_backend')}\nVoice: {os.path.basename(self.config.get('omnivoice_ref_clip', '')) or 'None'}",
+            text=f"OCR: Initializing...\nTTS: {self.config.get('tts_backend')}\nVoice: {os.path.basename(self.config.get('cosyvoice_ref_clip', '')) or 'None'}",
             font=("Helvetica", 11), text_color="#94a3b8", justify="left"
         )
         self.lbl_status.pack(pady=16, padx=12, anchor="w")
@@ -2363,25 +2144,18 @@ class ManhwaReaderApp(ctk.CTk):
 
         ctk.CTkLabel(scroll, text="Voice Engine Backend", font=("Helvetica", 13, "bold")).pack(anchor="w", pady=(8, 4))
         self.seg_tts = ctk.CTkSegmentedButton(
-            scroll, values=["CosyVoice (Local Clone)", "Gemini API (GenAI)", "Edge-TTS (Studio HD)", "Local PyTTSx3"],
+            scroll, values=["Gemini API (GenAI)", "Edge-TTS (Studio HD)", "CosyVoice (Local Clone)"],
             command=self.save_and_apply
         )
         current_tts = self.config.get("tts_backend")
         if current_tts == "cosyvoice":
             self.seg_tts.set("CosyVoice (Local Clone)")
-        elif current_tts == "omnivoice":
-            self.seg_tts.set("Gemini API (GenAI)")
         elif current_tts == "edgetts":
             self.seg_tts.set("Edge-TTS (Studio HD)")
         else:
-            self.seg_tts.set("Local PyTTSx3")
+            self.seg_tts.set("Gemini API (GenAI)")
         self.seg_tts.pack(fill="x", pady=4)
 
-        # OmniVoice Section
-        ctk.CTkLabel(scroll, text="OmniVoice Gradio Endpoint", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(12, 2))
-        self.ent_url = ctk.CTkEntry(scroll, placeholder_text="http://127.0.0.1:8001")
-        self.ent_url.insert(0, self.config.get("omnivoice_url", "http://127.0.0.1:8001"))
-        self.ent_url.pack(fill="x", pady=4)
 
         ctk.CTkLabel(scroll, text="Local CosyVoice Gradio Endpoint", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(12, 2))
         self.ent_cosy_url = ctk.CTkEntry(scroll, placeholder_text="http://127.0.0.1:50000")
@@ -2396,14 +2170,14 @@ class ManhwaReaderApp(ctk.CTk):
         ref_row = ctk.CTkFrame(scroll, fg_color="transparent")
         ref_row.pack(fill="x", pady=4)
         self.ent_ref = ctk.CTkEntry(ref_row, placeholder_text="audio.wav or full path")
-        self.ent_ref.insert(0, self.config.get("omnivoice_ref_clip", "audio.wav"))
+        self.ent_ref.insert(0, self.config.get("cosyvoice_ref_clip", "audio.wav"))
         self.ent_ref.pack(side="left", fill="x", expand=True, padx=(0, 8))
         btn_browse = ctk.CTkButton(ref_row, text="Browse...", width=100, command=self.browse_audio_file)
         btn_browse.pack(side="right")
 
         ctk.CTkLabel(scroll, text="Reference Audio Transcript (Exact Words Spoken in Clip - Highly Recommended!)", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(12, 2))
         self.ent_transcript = ctk.CTkEntry(scroll, placeholder_text="Exact words spoken in your audio clip (e.g. She received the symbol...)")
-        self.ent_transcript.insert(0, self.config.get("omnivoice_ref_text", ""))
+        self.ent_transcript.insert(0, self.config.get("cosyvoice_ref_text", ""))
         self.ent_transcript.pack(fill="x", pady=4)
 
         # Edge-TTS Voice Select
@@ -2435,16 +2209,6 @@ class ManhwaReaderApp(ctk.CTk):
         self.sld_speed.set(self.config.get("speech_speed", 1.0))
         self.sld_speed.pack(fill="x", pady=4)
 
-        # OmniVoice Duration Cushion (Prevents diffusion looping / rereading)
-        ctk.CTkLabel(scroll, text="OmniVoice Duration Pacing (1.0x = Exact tight timing, prevents looping/rereading)", font=("Helvetica", 12, "bold")).pack(anchor="w", pady=(12, 2))
-        self.lbl_dur_val = ctk.CTkLabel(scroll, text=f"{self.config.get('omnivoice_duration_scale', 1.0)}x", font=("Helvetica", 11), text_color="#38bdf8")
-        self.lbl_dur_val.pack(anchor="w")
-        self.sld_dur = ctk.CTkSlider(
-            scroll, from_=0.75, to=1.40, number_of_steps=13,
-            command=lambda v: self.lbl_dur_val.configure(text=f"{round(v, 2)}x")
-        )
-        self.sld_dur.set(self.config.get("omnivoice_duration_scale", 1.0))
-        self.sld_dur.pack(fill="x", pady=4)
 
         # Punctuation & Dash cleaner toggle
         self.chk_dash_clean = ctk.CTkCheckBox(
@@ -2524,12 +2288,10 @@ class ManhwaReaderApp(ctk.CTk):
         tts_selection = self.seg_tts.get()
         if "CosyVoice" in tts_selection:
             backend = "cosyvoice"
-        elif "Gemini" in tts_selection:
-            backend = "omnivoice"
         elif "Edge-TTS" in tts_selection:
             backend = "edgetts"
         else:
-            backend = "pyttsx3"
+            backend = "gemini"
 
         ocr_selection = self.seg_ocr.get()
         if "RapidOCR" in ocr_selection: ocr_pref = "rapidocr"
@@ -2538,11 +2300,10 @@ class ManhwaReaderApp(ctk.CTk):
         else: ocr_pref = "auto"
 
         self.config["tts_backend"] = backend
-        self.config["omnivoice_url"] = self.ent_url.get().strip()
         self.config["cosyvoice_url"] = self.ent_cosy_url.get().strip()
         self.config["cosyvoice_mode"] = self.ent_cosy_mode.get()
-        self.config["omnivoice_ref_clip"] = self.ent_ref.get().strip()
-        self.config["omnivoice_ref_text"] = self.ent_transcript.get().strip()
+        self.config["cosyvoice_ref_clip"] = self.ent_ref.get().strip()
+        self.config["cosyvoice_ref_text"] = self.ent_transcript.get().strip()
         self.config["edge_tts_voice"] = self.ent_edge_voice.get()
         self.config["ocr_engine_preference"] = ocr_pref
         self.config["ocr_confidence"] = round(float(self.sld_conf.get()), 2)
@@ -2552,7 +2313,6 @@ class ManhwaReaderApp(ctk.CTk):
         self.config["scroll_interval_sec"] = round(float(self.sld_interval.get()), 2)
         self.config["pause_scroll_on_text"] = bool(self.chk_pause_on_text.get())
         self.config["speech_speed"] = round(float(self.sld_speed.get()), 2)
-        self.config["omnivoice_duration_scale"] = round(float(self.sld_dur.get()), 2) if hasattr(self, 'sld_dur') else 1.0
         self.config["sanitize_tts_punctuation"] = bool(self.chk_dash_clean.get()) if hasattr(self, 'chk_dash_clean') else True
         self.config["bubble_settle_sec"] = round(float(self.sld_settle.get()), 2)
         self.config["min_dialogue_words"] = int(self.sld_min_words.get())
@@ -2562,7 +2322,7 @@ class ManhwaReaderApp(ctk.CTk):
         self.engine.update_config(self.config)
 
         self.lbl_status.configure(
-            text=f"OCR: {self.engine.ocr.engine_type if self.engine.ocr else 'Auto'}\nTTS: {self.config.get('tts_backend')}\nVoice: {os.path.basename(self.config.get('omnivoice_ref_clip', '')) or 'None'}"
+            text=f"OCR: {self.engine.ocr.engine_type if self.engine.ocr else 'Auto'}\nTTS: {self.config.get('tts_backend')}\nVoice: {os.path.basename(self.config.get('cosyvoice_ref_clip', '')) or 'None'}"
         )
         self.log("💾 Settings Saved & Applied!")
 
@@ -2579,12 +2339,6 @@ class ManhwaReaderApp(ctk.CTk):
                 self.log(f"✅ OCR SUCCESS ({elapsed_ms}ms)! Detected:\n'{norm}'")
             else:
                 self.log(f"ℹ️ OCR Completed ({elapsed_ms}ms) - No speech bubble text found inside the green Read Zone.")
-
-    def inspect_omnivoice(self):
-        if isinstance(self.engine.tts, OmniVoiceTTS):
-            self.engine.tts.inspect_api(log_fn=self.log)
-        else:
-            self.log("ℹ️ OmniVoice is not active. Switch Voice Backend to OmniVoice to inspect.")
 
     def test_tts_playback(self):
         sample_text = "The gate's rank was an unidentifiable black."
